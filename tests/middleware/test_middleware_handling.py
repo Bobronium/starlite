@@ -41,8 +41,7 @@ class MiddlewareProtocolRequestLoggingMiddleware(MiddlewareProtocol):
 
 class BaseMiddlewareRequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:  # type: ignore[override]
-        logger = logging.getLogger(__name__)
-        logger.info("%s - %s", request.method, request.url)
+        logging.getLogger(__name__).info("%s - %s", request.method, request.url)
         return await call_next(request)  # type: ignore
 
 
@@ -67,12 +66,7 @@ class CustomHeaderMiddleware(BaseHTTPMiddleware):
 )
 def test_custom_middleware_processing(middleware: Any) -> None:
     app = Starlite(route_handlers=[], middleware=[middleware])
-    unpacked_middleware = []
-    cur = app.middleware_stack
-    while hasattr(cur, "app"):
-        unpacked_middleware.append(cur)
-        cur = cur.app  # type: ignore
-    assert len(unpacked_middleware) == 2
+    assert app.middleware == middleware
 
 
 @get(path="/")
@@ -101,19 +95,19 @@ def test_setting_cors_middleware() -> None:
     assert cors_config.max_age == 600
     assert cors_config.expose_headers == []
 
-    client = create_test_client(route_handlers=[handler], cors_config=cors_config)
-    unpacked_middleware = []
-    cur = client.app.middleware_stack
-    while hasattr(cur, "app"):
-        unpacked_middleware.append(cur)
-        cur = cur.app  # type: ignore
-    assert len(unpacked_middleware) == 2
-    cors_middleware = unpacked_middleware[0]
-    assert isinstance(cors_middleware, CORSMiddleware)
-    assert cors_middleware.allow_headers == ["*", "accept", "accept-language", "content-language", "content-type"]
-    assert cors_middleware.allow_methods == ("DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT")
-    assert cors_middleware.allow_origins == cors_config.allow_origins
-    assert cors_middleware.allow_origin_regex == cors_config.allow_origin_regex
+    with create_test_client(route_handlers=[handler], cors_config=cors_config):
+        unpacked_middleware = []
+        cur = handler.resolved_middleware
+        while hasattr(cur, "app"):
+            unpacked_middleware.append(cur)
+            cur = cur.app  # type: ignore
+        assert len(unpacked_middleware) == 1
+        cors_middleware = unpacked_middleware[0]
+        assert isinstance(cors_middleware, CORSMiddleware)
+        assert cors_middleware.allow_headers == ["*", "accept", "accept-language", "content-language", "content-type"]
+        assert cors_middleware.allow_methods == ("DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT")
+        assert cors_middleware.allow_origins == cors_config.allow_origins
+        assert cors_middleware.allow_origin_regex == cors_config.allow_origin_regex
 
 
 def test_trusted_hosts_middleware() -> None:

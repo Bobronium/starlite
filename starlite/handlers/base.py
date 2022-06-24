@@ -20,7 +20,7 @@ from starlette.requests import HTTPConnection
 from starlite.exceptions import ImproperlyConfiguredException
 from starlite.provide import Provide
 from starlite.signature import SignatureModel
-from starlite.types import Guard
+from starlite.types import Guard, Middleware
 from starlite.utils import is_async_callable, normalize_path
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -33,12 +33,14 @@ class BaseRouteHandler:
         """Placeholder"""
 
     __slots__ = (
-        "paths",
+        "resolved_middleware",
         "dependencies",
-        "guards",
-        "opt",
         "fn",
+        "guards",
+        "middleware",
+        "opt",
         "owner",
+        "paths",
         "resolved_dependencies",
         "resolved_dependency_name_set",
         "resolved_guards",
@@ -52,6 +54,7 @@ class BaseRouteHandler:
         dependencies: Optional[Dict[str, "Provide"]] = None,
         guards: Optional[List[Guard]] = None,
         opt: Optional[Dict[str, Any]] = None,
+        middleware: Optional[List[Middleware]] = None,
     ):
         self.paths: List[str] = (
             [normalize_path(p) for p in path]
@@ -60,12 +63,14 @@ class BaseRouteHandler:
         )
         self.dependencies = dependencies
         self.guards = guards
+        self.middleware = middleware
         self.opt: Dict[str, Any] = opt or {}
         self.fn: Optional[AnyCallable] = None
         self.owner: Optional[Union["Controller", "Router"]] = None
         self.resolved_dependencies: Union[Dict[str, Provide], Type[BaseRouteHandler.empty]] = BaseRouteHandler.empty
         self.resolved_dependency_name_set: Union[Set[str], Type[BaseRouteHandler.empty]] = BaseRouteHandler.empty
         self.resolved_guards: Union[List[Guard], Type[BaseRouteHandler.empty]] = BaseRouteHandler.empty
+        self.resolved_middleware: Union[List[Middleware], Type[BaseRouteHandler.empty]] = BaseRouteHandler.empty
         self.signature_model: Optional[Type[SignatureModel]] = None
 
     @property
@@ -150,3 +155,14 @@ class BaseRouteHandler:
                 await guard(connection, copy(self))  # type: ignore[misc]
             else:
                 await run_sync(guard, connection, copy(self))
+
+    def resolve_middleware(self) -> List[Middleware]:
+        """
+        Builds the middleware stack by passing middlewares in a specific order
+        """
+        if self.resolved_middleware is BaseRouteHandler.empty:
+            self.resolved_middleware: List[Middleware] = []
+            for layer in reversed(list(self.ownership_layers())):
+                if layer.middleware:
+                    self.resolved_middleware.extend(layer.middleware)
+        return cast(List[Middleware], self.resolved_middleware)

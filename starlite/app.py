@@ -5,15 +5,11 @@ from openapi_schema_pydantic.util import construct_open_api_with_schema_class
 from pydantic import Extra, validate_arguments
 from pydantic.typing import AnyCallable
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.errors import ServerErrorMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response as StarletteResponse
 from starlette.staticfiles import StaticFiles
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import Receive, Scope, Send
 from typing_extensions import Type
 
 from starlite.asgi import StarliteASGIRouter
@@ -44,7 +40,7 @@ from starlite.types import (
     ExceptionHandler,
     Guard,
     LifeCycleHandler,
-    MiddlewareProtocol,
+    Middleware,
     ResponseHeader,
 )
 from starlite.utils import normalize_path
@@ -58,7 +54,6 @@ class Starlite(Router):
     __slots__ = (
         "asgi_router",
         "debug",
-        "middleware_stack",
         "openapi_schema",
         "plugins",
         "state",
@@ -67,6 +62,8 @@ class Starlite(Router):
         "plain_routes",
         "template_engine",
         "cache_config",
+        "cors_config",
+        "allowed_hosts",
         # the rest of __slots__ are defined in Router and should not be duplicated
         # see: https://stackoverflow.com/questions/472000/usage-of-slots
     )
@@ -75,29 +72,25 @@ class Starlite(Router):
     def __init__(
         self,
         *,
-        route_handlers: List[ControllerRouterHandler],
+        after_request: Optional[AfterRequestHandler] = None,
         allowed_hosts: Optional[List[str]] = None,
+        before_request: Optional[BeforeRequestHandler] = None,
+        cache_config: CacheConfig = DEFAULT_CACHE_CONFIG,
         cors_config: Optional[CORSConfig] = None,
         debug: bool = False,
         dependencies: Optional[Dict[str, Provide]] = None,
         exception_handlers: Optional[Dict[Union[int, Type[Exception]], ExceptionHandler]] = None,
         guards: Optional[List[Guard]] = None,
-        middleware: Optional[List[Union[Middleware, Type[BaseHTTPMiddleware], Type[MiddlewareProtocol]]]] = None,
+        middleware: Optional[List[Middleware]] = None,
         on_shutdown: Optional[List[LifeCycleHandler]] = None,
         on_startup: Optional[List[LifeCycleHandler]] = None,
         openapi_config: Optional[OpenAPIConfig] = DEFAULT_OPENAPI_CONFIG,
+        plugins: Optional[List[PluginProtocol]] = None,
         response_class: Optional[Type[Response]] = None,
         response_headers: Optional[Dict[str, ResponseHeader]] = None,
-        plugins: Optional[List[PluginProtocol]] = None,
-        # connection-lifecycle hook handlers
-        before_request: Optional[BeforeRequestHandler] = None,
-        after_request: Optional[AfterRequestHandler] = None,
-        # static files
+        route_handlers: List[ControllerRouterHandler],
         static_files_config: Optional[Union[StaticFilesConfig, List[StaticFilesConfig]]] = None,
-        # template
         template_config: Optional[TemplateConfig] = None,
-        # cache
-        cache_config: CacheConfig = DEFAULT_CACHE_CONFIG,
     ):
         self.debug = debug
         self.state = State()
@@ -107,6 +100,8 @@ class Starlite(Router):
         self.static_paths = set()
         self.plain_routes: Set[str] = set()
         self.cache_config = cache_config
+        self.cors_config = cors_config
+        self.allowed_hosts = allowed_hosts
         super().__init__(
             dependencies=dependencies,
             guards=guards,
@@ -117,11 +112,9 @@ class Starlite(Router):
             before_request=before_request,
             after_request=after_request,
         )
+        self.middleware = middleware
         self.asgi_router = StarliteASGIRouter(on_shutdown=on_shutdown or [], on_startup=on_startup or [], app=self)
         self.exception_handlers: Dict[Union[int, Type[Exception]], ExceptionHandler] = exception_handlers or {}
-        self.middleware_stack: ASGIApp = self.build_middleware_stack(
-            user_middleware=middleware or [], cors_config=cors_config, allowed_hosts=allowed_hosts
-        )
         if openapi_config:
             self.openapi_schema = self.create_openapi_schema_model(openapi_config=openapi_config)
             self.register(openapi_config.openapi_controller)
@@ -146,7 +139,7 @@ class Starlite(Router):
             return
         try:
             scope["state"] = {}
-            await self.middleware_stack(scope, receive, send)
+            await self.asgi_router(scope, receive, send)
         except Exception as e:  # pylint: disable=broad-except
             await self.handle_exception(scope=scope, receive=receive, send=send, exc=e)
 
@@ -223,6 +216,7 @@ class Starlite(Router):
             for route_handler in route_handlers:
                 self.create_handler_signature_model(route_handler=route_handler)
                 route_handler.resolve_guards()
+                route_handler.resolve_middleware()
                 if isinstance(route_handler, HTTPRouteHandler):
                     route_handler.resolve_response_class()
                     route_handler.resolve_before_request()
@@ -250,30 +244,6 @@ class Starlite(Router):
                     plugins=self.plugins,
                     provided_dependency_names=route_handler.dependency_name_set,
                 )
-
-    def build_middleware_stack(
-        self,
-        user_middleware: List[Union[Middleware, Type[BaseHTTPMiddleware], Type[MiddlewareProtocol]]],
-        allowed_hosts: Optional[List[str]],
-        cors_config: Optional[CORSConfig],
-    ) -> ASGIApp:
-        """
-        Builds the middleware stack by passing middlewares in a specific order
-        """
-        current_app: ASGIApp = self.asgi_router
-        # last added middleware will be on the top of stack and it will therefore be called first.
-        # we therefore need to reverse the middlewares to keep the call order according to
-        # the middlewares' list provided by the user
-        for middleware in reversed(user_middleware):
-            if isinstance(middleware, Middleware):
-                current_app = middleware.cls(app=current_app, **middleware.options)
-            else:
-                current_app = middleware(app=current_app)
-        if allowed_hosts:
-            current_app = TrustedHostMiddleware(app=current_app, allowed_hosts=allowed_hosts)
-        if cors_config:
-            current_app = CORSMiddleware(app=current_app, **cors_config.dict())
-        return current_app
 
     def default_http_exception_handler(self, request: Request, exc: Exception) -> StarletteResponse:
         """Default handler for exceptions subclassed from HTTPException"""

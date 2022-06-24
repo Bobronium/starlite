@@ -1,11 +1,14 @@
 from inspect import getfullargspec, isawaitable, ismethod
 from typing import TYPE_CHECKING, Any, Dict, List, Set, Union, cast
 
+from starlette.middleware import Middleware as StarletteMiddleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.routing import Router as StarletteRouter
 from starlette.routing import WebSocketRoute
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from starlite.exceptions import NotFoundException
+from starlite.exceptions import MethodNotAllowedException, NotFoundException
 from starlite.parsers import parse_path_params
 from starlite.routes import ASGIRoute, HTTPRoute
 from starlite.types import LifeCycleHandler
@@ -28,10 +31,7 @@ class StarliteASGIRouter(StarletteRouter):
         self.app = app
         super().__init__(on_startup=on_startup, on_shutdown=on_shutdown)
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        """
-        The main entry point to the Router class.
-        """
+    def resolve_route(self, scope: Scope) -> Union[HTTPRoute, WebSocketRoute, ASGIRoute]:
         scope_type = scope["type"]
         path_params: List[str] = []
         path = cast(str, scope["path"]).strip()
@@ -64,10 +64,37 @@ class StarliteASGIRouter(StarletteRouter):
                 handlers[scope_type if scope_type in handler_types else "asgi"],
             )
             scope["path_params"] = parse_path_params(route.path_parameters, path_params) if route.path_parameters else {}  # type: ignore
+            return route
         except KeyError as e:
             raise NotFoundException() from e
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        The main entry point to the Router class.
+        """
+        route = self.resolve_route(scope)
+        if hasattr(route, "route_handlers"):
+            http_route = cast(HTTPRoute, route)
+            if scope["method"] not in http_route.methods:
+                raise MethodNotAllowedException()
+            route_handler = http_route.route_handler_map[scope["method"]][0]
         else:
-            await route.handle(scope=scope, receive=receive, send=send)
+            route_handler = cast(Union[WebSocketRoute, ASGIRoute], route).route_handler
+        resolved_middleware = route_handler.resolve_middleware()
+        asgi_handler: ASGIApp = route.handle
+
+        for middleware in reversed(resolved_middleware):
+            if isinstance(middleware, StarletteMiddleware):
+                asgi_handler = middleware.cls(app=asgi_handler, **middleware.options)
+            else:
+                asgi_handler = middleware(app=asgi_handler)
+
+        if self.app.allowed_hosts:
+            asgi_handler = TrustedHostMiddleware(app=asgi_handler, allowed_hosts=self.app.allowed_hosts)
+        if self.app.cors_config:
+            asgi_handler = CORSMiddleware(app=asgi_handler, **self.app.cors_config.dict())
+
+        await asgi_handler(scope, receive, send)
 
     async def call_lifecycle_handler(self, handler: LifeCycleHandler) -> None:
         """
